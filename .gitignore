@@ -22,3 +22,6 @@ sample_test.png
 
 # Data directories
 data/
+
+# Training checkpoints
+checkpoint/

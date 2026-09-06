@@ -3,28 +3,42 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _min_dist_one_direction(src: torch.Tensor, tgt: torch.Tensor, chunk_size: int) -> torch.Tensor:
+def _min_dist_one_direction(src: torch.Tensor, tgt: torch.Tensor, chunk_size: int = 512) -> torch.Tensor:
     """For each point in src, find squared distance to nearest point in tgt.
+    Memory-efficient: nearest neighbor indices are computed under no_grad so
+    the large pairwise distance matrices (B, chunk_size, M) are never retained
+    in the autograd graph. Gradients flow directly through gathered matched points.
+    
     Args:
         src: (B, N, 3)
         tgt: (B, M, 3)
+        chunk_size: number of points to process per chunk to minimize peak VRAM
     Returns:
         min_dists: (B, N) minimum squared distances
     """
-    tgt_sq = torch.sum(tgt ** 2, dim=-1, keepdim=True)  # (B, M, 1)
-    result = []
-    for i in range(0, src.shape[1], chunk_size):
-        chunk = src[:, i : i + chunk_size, :]                        # (B, nc, 3)
-        chunk_sq = torch.sum(chunk ** 2, dim=-1, keepdim=True)       # (B, nc, 1)
-        # squared distance between each chunk point and every tgt point
-        dist = chunk_sq + tgt_sq.transpose(1, 2) - 2.0 * torch.bmm(chunk, tgt.transpose(1, 2))
-        dist = torch.clamp(dist, min=0.0)                            # (B, nc, M)
-        min_d, _ = torch.min(dist, dim=-1)                           # (B, nc)
-        result.append(min_d)
-    return torch.cat(result, dim=1)                                  # (B, N)
+    B, N, _ = src.shape
+    M = tgt.shape[1]
+
+    # Find nearest neighbor indices under no_grad (frees chunk tensors immediately)
+    idx_list = []
+    with torch.no_grad():
+        tgt_sq = torch.sum(tgt ** 2, dim=-1, keepdim=True)  # (B, M, 1)
+        for i in range(0, N, chunk_size):
+            chunk = src[:, i : i + chunk_size, :]                        # (B, nc, 3)
+            chunk_sq = torch.sum(chunk ** 2, dim=-1, keepdim=True)       # (B, nc, 1)
+            dist = chunk_sq + tgt_sq.transpose(1, 2) - 2.0 * torch.bmm(chunk, tgt.transpose(1, 2))
+            min_idx = torch.argmin(dist, dim=-1)                         # (B, nc)
+            idx_list.append(min_idx)
+
+    nearest_idx = torch.cat(idx_list, dim=1)                             # (B, N)
+    # Gather matched points: (B, N, 3)
+    matched_tgt = torch.gather(tgt, 1, nearest_idx.unsqueeze(-1).expand(-1, -1, 3))
+    # Exact squared Euclidean distance with O(N) backward memory instead of O(N*M)
+    min_dists = torch.sum((src - matched_tgt) ** 2, dim=-1)              # (B, N)
+    return min_dists
 
 
-def chamfer_distance_chunked(p1: torch.Tensor, p2: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
+def chamfer_distance_chunked(p1: torch.Tensor, p2: torch.Tensor, chunk_size: int = 512) -> torch.Tensor:
     """Memory-efficient bidirectional Chamfer Distance (mean of squared Euclidean distances).
 
     Why chunked? Computing (B, N, M) distance matrix at once for N=16384 causes OOM.
@@ -44,7 +58,7 @@ def chamfer_distance_chunked(p1: torch.Tensor, p2: torch.Tensor, chunk_size: int
 
 class ChamferLoss(nn.Module):
     """Wraps chamfer_distance_chunked as an nn.Module."""
-    def __init__(self, chunk_size: int = 2048):
+    def __init__(self, chunk_size: int = 512):
         super().__init__()
         self.chunk_size = chunk_size
 
@@ -68,7 +82,7 @@ class HORTLoss(nn.Module):
         lambda_pose: float = 2.0,
         lambda_sparse_cd: float = 2.0,
         lambda_dense_cd: float = 1.0,
-        chunk_size: int = 2048,
+        chunk_size: int = 256,
     ):
         super().__init__()
         self.lambda_pose = lambda_pose

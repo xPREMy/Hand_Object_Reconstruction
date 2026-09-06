@@ -28,9 +28,10 @@ loss:
   lambda_pose: 2.0
   lambda_sparse_cd: 2.0
   lambda_dense_cd: 1.0
+  chamfer_chunk_size: 256
 
 training:
-  batch_size: 192
+  batch_size: 4   # 4 for 6GB-8GB GPUs (paper used 192 across 4x A100 GPUs)
   epochs: 50
   lr: 0.0001
   min_lr: 0.000001

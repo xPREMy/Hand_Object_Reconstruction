@@ -6,8 +6,37 @@ import torch
 from torch.utils.data import DataLoader
 
 from models.hort import HORT
+import json
+import trimesh
 from losses.chamfer import chamfer_distance_chunked
 from train import build_model, build_dataset, load_config
+
+
+def export_point_cloud(points: np.ndarray, file_path: str):
+    """Save point cloud as .ply."""
+    try:
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+        o3d.io.write_point_cloud(file_path, pcd)
+    except Exception:
+        pcd = trimesh.PointCloud(vertices=points)
+        pcd.export(file_path)
+
+
+def export_mesh(points: np.ndarray, file_path: str):
+    """Generate surface mesh via Open3D Poisson Reconstruction or Convex Hull fallback."""
+    try:
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30))
+        pcd.orient_normals_consistent_tangent_plane(10)
+        mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
+        o3d.io.write_triangle_mesh(file_path, mesh)
+    except Exception:
+        hull = trimesh.convex.convex_hull(points)
+        hull.export(file_path)
 
 
 def compute_f_score(
@@ -23,14 +52,11 @@ def compute_f_score(
     Returns:
         f_score: scalar in [0, 1]
     """
-    # Precision: p_pred -> p_gt
-    # (N, 1, 3) - (1, M, 3)
     diff_p = p_pred.unsqueeze(1) - p_gt.unsqueeze(0)             # (N, M, 3)
     dist_p = torch.norm(diff_p, dim=-1)                          # (N, M)
     min_dist_p, _ = torch.min(dist_p, dim=-1)                    # (N,)
     precision = torch.mean((min_dist_p < threshold).float()).item()
 
-    # Recall: p_gt -> p_pred
     min_dist_q, _ = torch.min(dist_p, dim=0)                     # (M,)
     recall = torch.mean((min_dist_q < threshold).float()).item()
 
@@ -42,7 +68,10 @@ def compute_f_score(
 def validate(
     model: HORT,
     loader: DataLoader,
-    device: torch.device
+    device: torch.device,
+    save_dir: str | None = None,
+    max_save_models: int = 20,
+    save_mesh: bool = True
 ) -> dict:
     model.eval()
     chamfer_denses = []
@@ -51,8 +80,12 @@ def validate(
     f_scores_5 = []
     f_scores_10 = []
 
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    saved_count = 0
+
     with torch.no_grad():
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
             images = batch["image"].to(device)
             hand_verts = batch["hand_verts"].to(device)
             hand_joints = batch["hand_joints"].to(device)
@@ -91,19 +124,63 @@ def validate(
                 f_scores_5.append(fs5)
                 f_scores_10.append(fs10)
 
-    # In paper, CD is in cm^2: 1 m^2 = 10000 cm^2
+                # Export 3D models if requested
+                if save_dir and saved_count < max_save_models:
+                    sample_id = f"sample_{saved_count:03d}"
+                    palm_np = palm_coord[b].cpu().numpy()
+                    to_np = pred_trans[b].cpu().numpy()
+                    
+                    # Convert to camera frame: P_cam = P_local + palm + to
+                    pred_sparse_cam = pred_sparse[b].cpu().numpy() + palm_np + to_np
+                    pred_dense_cam = pred_dense[b].cpu().numpy() + palm_np + to_np
+                    hand_cam = hand_verts[b].cpu().numpy()
+                    
+                    # Save PLY point clouds
+                    sparse_path = os.path.join(save_dir, f"{sample_id}_pred_sparse.ply")
+                    dense_path = os.path.join(save_dir, f"{sample_id}_pred_dense.ply")
+                    hand_path = os.path.join(save_dir, f"{sample_id}_hand.ply")
+                    
+                    export_point_cloud(pred_sparse_cam, sparse_path)
+                    export_point_cloud(pred_dense_cam, dense_path)
+                    export_point_cloud(hand_cam, hand_path)
+                    
+                    # Ground truth dense cloud
+                    gt_to_np = gt_trans[b].cpu().numpy()
+                    gt_dense_cam = gt_dense[b].cpu().numpy() + palm_np + gt_to_np
+                    gt_dense_path = os.path.join(save_dir, f"{sample_id}_gt_dense.ply")
+                    export_point_cloud(gt_dense_cam, gt_dense_path)
+
+                    # Surface mesh
+                    if save_mesh:
+                        mesh_path = os.path.join(save_dir, f"{sample_id}_dense_mesh.ply")
+                        try:
+                            export_mesh(pred_dense_cam, mesh_path)
+                        except Exception:
+                            pass
+                    
+                    saved_count += 1
+
     mean_cd_cm2 = np.mean(chamfer_denses) * 10000.0
     mean_fs5 = np.mean(f_scores_5)
     mean_fs10 = np.mean(f_scores_10)
     mean_pose_cm = np.mean(pose_errors) * 100.0
 
-    return {
-        "cd_dense_cm2": mean_cd_cm2,
-        "fs@5": mean_fs5,
-        "fs@10": mean_fs10,
-        "pose_error_cm": mean_pose_cm,
-        "mean_sparse_cd": np.mean(chamfer_sparses)
+    results = {
+        "cd_dense_cm2": float(mean_cd_cm2),
+        "fs@5": float(mean_fs5),
+        "fs@10": float(mean_fs10),
+        "pose_error_cm": float(mean_pose_cm),
+        "mean_sparse_cd": float(np.mean(chamfer_sparses)),
+        "saved_3d_models_count": saved_count
     }
+
+    if save_dir:
+        summary_file = os.path.join(save_dir, "evaluation_summary.json")
+        with open(summary_file, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"[Validate] Saved 3D models and evaluation summary to: {save_dir}/")
+
+    return results
 
 
 def main():
@@ -114,6 +191,9 @@ def main():
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--save_dir", type=str, default=None, help="Directory to save 3D models and metrics JSON")
+    parser.add_argument("--max_save_models", type=int, default=20, help="Maximum number of 3D models to export")
+    parser.add_argument("--no_mesh", action="store_true", help="Disable surface mesh reconstruction")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -131,7 +211,14 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     print(f"[Validate] Evaluating on {len(val_dataset)} samples ({args.split} split)...")
-    results = validate(model, val_loader, device)
+    results = validate(
+        model=model,
+        loader=val_loader,
+        device=device,
+        save_dir=args.save_dir,
+        max_save_models=args.max_save_models,
+        save_mesh=not args.no_mesh
+    )
 
     print("\n" + "=" * 50)
     print(f"HORT Evaluation Results on {dataset_name.upper()} ({args.split}):")
@@ -140,6 +227,8 @@ def main():
     print(f"FS@10mm (↑)  : {results['fs@10']:.4f}")
     print(f"CD (cm²) (↓) : {results['cd_dense_cm2']:.4f}")
     print(f"Pose L1 (cm) : {results['pose_error_cm']:.4f}")
+    if args.save_dir:
+        print(f"3D Models    : Exported to {args.save_dir}/")
     print("=" * 50)
 
 

@@ -44,7 +44,8 @@ class LocalKNNSelfAttention(nn.Module):
         q_coords: torch.Tensor,
         q_feats: torch.Tensor,
         k_coords: torch.Tensor,
-        k_feats: torch.Tensor
+        k_feats: torch.Tensor,
+        chunk_size: int = 512
     ) -> torch.Tensor:
         """
         Args:
@@ -52,6 +53,7 @@ class LocalKNNSelfAttention(nn.Module):
             q_feats:  (B, N_q, C) query features
             k_coords: (B, N_k, 3) key/value 3D points
             k_feats:  (B, N_k, C) key/value features
+            chunk_size: number of query points to process per chunk to prevent CUDA OOM
         Returns:
             out_feats: (B, N_q, C) context-aggregated features
         """
@@ -59,35 +61,46 @@ class LocalKNNSelfAttention(nn.Module):
         _, N_k, _ = k_coords.shape
         k = min(self.k, N_k)
 
-        # 1. Compute pairwise distance squared: (B, N_q, N_k)
-        q_sq = torch.sum(q_coords ** 2, dim=-1, keepdim=True)       # (B, N_q, 1)
-        k_sq = torch.sum(k_coords ** 2, dim=-1, keepdim=True)       # (B, N_k, 1)
-        qk = torch.bmm(q_coords, k_coords.transpose(1, 2))          # (B, N_q, N_k)
-        dist = q_sq + k_sq.transpose(1, 2) - 2.0 * qk               # (B, N_q, N_k)
-        dist = torch.clamp(dist, min=0.0)
+        # Precompute k_sq under no_grad to save autograd graph memory
+        with torch.no_grad():
+            k_sq = torch.sum(k_coords ** 2, dim=-1, keepdim=True)       # (B, N_k, 1)
 
-        # 2. Find k nearest neighbors
-        _, knn_idx = torch.topk(-dist, k=k, dim=-1)                 # (B, N_q, k)
+        out_list = []
+        for i in range(0, N_q, chunk_size):
+            q_c_chunk = q_coords[:, i : i + chunk_size, :]              # (B, nc, 3)
+            q_f_chunk = q_feats[:, i : i + chunk_size, :]               # (B, nc, C)
 
-        # 3. Gather neighbor coordinates and features
-        neighbor_coords = knn_gather(k_coords, knn_idx)             # (B, N_q, k, 3)
-        neighbor_feats = knn_gather(k_feats, knn_idx)               # (B, N_q, k, C)
+            # 1. Compute chunk pairwise distance & find kNN under no_grad
+            # Nearest neighbor indexing is non-differentiable anyway, so no_grad prevents
+            # storing the large distance matrix in PyTorch's backward graph.
+            with torch.no_grad():
+                q_sq_chunk = torch.sum(q_c_chunk ** 2, dim=-1, keepdim=True) # (B, nc, 1)
+                qk_chunk = torch.bmm(q_c_chunk, k_coords.transpose(1, 2))   # (B, nc, N_k)
+                dist_chunk = q_sq_chunk + k_sq.transpose(1, 2) - 2.0 * qk_chunk
+                _, knn_idx = torch.topk(-dist_chunk, k=k, dim=-1)           # (B, nc, k)
 
-        # 4. Relative position encoding
-        delta_p = neighbor_coords - q_coords.unsqueeze(2)           # (B, N_q, k, 3)
-        pos_enc = self.pos_mlp(delta_p)                             # (B, N_q, k, C)
+            # 2. Gather neighbor coordinates and features
+            neighbor_coords = knn_gather(k_coords, knn_idx)                 # (B, nc, k, 3)
+            neighbor_feats = knn_gather(k_feats, knn_idx)                   # (B, nc, k, C)
 
-        # 5. Attention
-        Q = self.q_proj(q_feats).unsqueeze(2)                       # (B, N_q, 1, C)
-        K = self.k_proj(neighbor_feats + pos_enc)                   # (B, N_q, k, C)
-        V = self.v_proj(neighbor_feats + pos_enc)                   # (B, N_q, k, C)
+            # 3. Relative position encoding
+            delta_p = neighbor_coords - q_c_chunk.unsqueeze(2)              # (B, nc, k, 3)
+            pos_enc = self.pos_mlp(delta_p)                                 # (B, nc, k, C)
 
-        attn = torch.sum(Q * K, dim=-1, keepdim=True) / (self.channels ** 0.5)  # (B, N_q, k, 1)
-        attn = F.softmax(attn, dim=2)                               # (B, N_q, k, 1)
+            # 4. Attention
+            Q = self.q_proj(q_f_chunk).unsqueeze(2)                         # (B, nc, 1, C)
+            feat_pos = neighbor_feats + pos_enc
+            K = self.k_proj(feat_pos)                                       # (B, nc, k, C)
+            V = self.v_proj(feat_pos)                                       # (B, nc, k, C)
 
-        aggregated = torch.sum(attn * V, dim=2)                     # (B, N_q, C)
-        out = self.out_proj(aggregated)                             # (B, N_q, C)
+            attn = torch.sum(Q * K, dim=-1, keepdim=True) / (self.channels ** 0.5)  # (B, nc, k, 1)
+            attn = F.softmax(attn, dim=2)                                   # (B, nc, k, 1)
 
+            aggregated = torch.sum(attn * V, dim=2)                         # (B, nc, C)
+            out_chunk = self.out_proj(aggregated)                           # (B, nc, C)
+            out_list.append(out_chunk)
+
+        out = torch.cat(out_list, dim=1) if len(out_list) > 1 else out_list[0]
         return self.norm(q_feats + out)
 
 
@@ -298,14 +311,34 @@ class DenseDecoder(nn.Module):
 
         # 6. Progressive upsampling
         # Block 1: x2 upsampling (2048 -> 4096 points)
-        p_coords_1, p_feats_1 = self.block1(p_s, obj_feat, ctx_coords, ctx_feats) # (B, 4096, 3), (B, 4096, 128)
+        if self.training and p_s.requires_grad:
+            try:
+                p_coords_1, p_feats_1 = torch.utils.checkpoint.checkpoint(
+                    self.block1, p_s, obj_feat, ctx_coords, ctx_feats, use_reentrant=False
+                )
+            except TypeError:
+                p_coords_1, p_feats_1 = torch.utils.checkpoint.checkpoint(
+                    self.block1, p_s, obj_feat, ctx_coords, ctx_feats
+                )
+        else:
+            p_coords_1, p_feats_1 = self.block1(p_s, obj_feat, ctx_coords, ctx_feats) # (B, 4096, 3), (B, 4096, 128)
 
         # Update context with block 1 points
         ctx_coords_1 = torch.cat([p_coords_1, hand_rel_coords], dim=1)            # (B, 4096 + 778, 3)
         ctx_feats_1 = torch.cat([p_feats_1, hand_feat], dim=1)                     # (B, 4096 + 778, 128)
 
         # Block 2: x4 upsampling (4096 -> 16,384 points)
-        p_dense, _ = self.block2(p_coords_1, p_feats_1, ctx_coords_1, ctx_feats_1)# (B, 16384, 3)
+        if self.training and p_coords_1.requires_grad:
+            try:
+                p_dense, _ = torch.utils.checkpoint.checkpoint(
+                    self.block2, p_coords_1, p_feats_1, ctx_coords_1, ctx_feats_1, use_reentrant=False
+                )
+            except TypeError:
+                p_dense, _ = torch.utils.checkpoint.checkpoint(
+                    self.block2, p_coords_1, p_feats_1, ctx_coords_1, ctx_feats_1
+                )
+        else:
+            p_dense, _ = self.block2(p_coords_1, p_feats_1, ctx_coords_1, ctx_feats_1)# (B, 16384, 3)
 
         assert p_dense.shape[1] == self.num_dense_points, \
             f"Expected {self.num_dense_points} dense points, got {p_dense.shape[1]}"

@@ -92,8 +92,16 @@ class SparseDecoder(nn.Module):
         queries = torch.cat([pose_queries, point_queries], dim=1)  # (B, 2049, 512)
 
         # 3. Transformer decoding with self-attention & cross-attention
-        out = self.transformer_decoder(tgt=queries, memory=memory)  # (B, 2049, 512)
-        out = self.norm(out)
+        tgt = queries
+        for layer in self.transformer_decoder.layers:
+            if self.training and (tgt.requires_grad or memory.requires_grad):
+                try:
+                    tgt = torch.utils.checkpoint.checkpoint(layer, tgt, memory, use_reentrant=False)
+                except TypeError:
+                    tgt = torch.utils.checkpoint.checkpoint(layer, tgt, memory)
+            else:
+                tgt = layer(tgt, memory)
+        out = self.norm(tgt)
 
         # 4. Predict outputs
         pose_feat = out[:, 0, :]                               # (B, 512)

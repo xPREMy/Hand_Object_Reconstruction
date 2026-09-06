@@ -4,6 +4,7 @@ import yaml
 import torch
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm.auto import tqdm
 
 from models.hort import HORT
 from losses.chamfer import HORTLoss
@@ -113,6 +114,9 @@ def build_model(cfg: dict, device: torch.device) -> HORT:
     return model.to(device)
 
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
 def train_one_epoch(
     model: HORT,
     loader: DataLoader,
@@ -120,56 +124,74 @@ def train_one_epoch(
     criterion: HORTLoss,
     device: torch.device,
     epoch: int,
+    scaler: torch.cuda.amp.GradScaler | None = None,
+    grad_accum_steps: int = 1,
     log_interval: int = 10
 ) -> float:
     model.train()
     total_loss = 0.0
     num_batches = len(loader)
+    optimizer.zero_grad(set_to_none=True)
+    use_amp = scaler is not None and device.type == "cuda"
 
-    for step, batch in enumerate(loader):
-        images = batch["image"].to(device)
-        hand_verts = batch["hand_verts"].to(device)
-        hand_joints = batch["hand_joints"].to(device)
-        palm_coord = batch["palm_coord"].to(device)
-        cam_intr = batch["cam_intr"].to(device)
-        gt_trans = batch["gt_trans"].to(device)
-        gt_sparse = batch["gt_points_sparse"].to(device)
-        gt_dense = batch["gt_points_dense"].to(device)
+    progress_bar = tqdm(loader, desc=f"Epoch {epoch}", unit="batch")
+    for step, batch in enumerate(progress_bar):
+        images = batch["image"].to(device, non_blocking=True)
+        hand_verts = batch["hand_verts"].to(device, non_blocking=True)
+        hand_joints = batch["hand_joints"].to(device, non_blocking=True)
+        palm_coord = batch["palm_coord"].to(device, non_blocking=True)
+        cam_intr = batch["cam_intr"].to(device, non_blocking=True)
+        gt_trans = batch["gt_trans"].to(device, non_blocking=True)
+        gt_sparse = batch["gt_points_sparse"].to(device, non_blocking=True)
+        gt_dense = batch["gt_points_dense"].to(device, non_blocking=True)
 
-        optimizer.zero_grad()
+        # Forward pass with Automatic Mixed Precision (AMP)
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
+            preds = model(
+                image=images,
+                hand_verts=hand_verts,
+                hand_joints=hand_joints,
+                palm_coord=palm_coord,
+                cam_intr=cam_intr
+            )
 
-        # Forward pass
-        preds = model(
-            image=images,
-            hand_verts=hand_verts,
-            hand_joints=hand_joints,
-            palm_coord=palm_coord,
-            cam_intr=cam_intr
-        )
+            loss_dict = criterion(
+                pred_trans=preds["pred_trans"],
+                gt_trans=gt_trans,
+                pred_sparse_points=preds["sparse_points"],
+                gt_sparse_points=gt_sparse,
+                pred_dense_points=preds["dense_points"],
+                gt_dense_points=gt_dense
+            )
+            raw_loss = loss_dict["loss"]
+            loss = raw_loss / grad_accum_steps
 
-        # Compute composite loss
-        loss_dict = criterion(
-            pred_trans=preds["pred_trans"],
-            gt_trans=gt_trans,
-            pred_sparse_points=preds["sparse_points"],
-            gt_sparse_points=gt_sparse,
-            pred_dense_points=preds["dense_points"],
-            gt_dense_points=gt_dense
-        )
+        # Backward pass
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
-        loss = loss_dict["loss"]
-        loss.backward()
-        optimizer.step()
+        # Step optimizer every grad_accum_steps
+        if (step + 1) % grad_accum_steps == 0 or (step + 1) == num_batches:
+            if use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        total_loss += loss.item()
+        total_loss += raw_loss.item()
 
         if (step + 1) % log_interval == 0 or (step + 1) == num_batches:
-            print(
-                f"Epoch [{epoch}][{step+1}/{num_batches}] "
-                f"Total: {loss.item():.4f} | "
-                f"Pose (L1): {loss_dict['loss_pose'].item():.4f} | "
-                f"Sparse CD: {loss_dict['loss_sparse_cd'].item():.4f} | "
-                f"Dense CD: {loss_dict['loss_dense_cd'].item():.4f}"
+            progress_bar.set_postfix(
+                total=f"{raw_loss.item():.4f}",
+                pose=f"{loss_dict['loss_pose'].item():.4f}",
+                sparse_cd=f"{loss_dict['loss_sparse_cd'].item():.4f}",
+                dense_cd=f"{loss_dict['loss_dense_cd'].item():.4f}"
             )
 
     return total_loss / max(1, num_batches)
@@ -181,10 +203,12 @@ def main():
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Accumulate gradients across steps for lower VRAM")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--no_amp", action="store_true", help="Disable automatic mixed precision (AMP)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -193,14 +217,20 @@ def main():
 
     dataset_name = args.dataset or cfg.get("dataset", {}).get("name", "obman")
     epochs = args.epochs or t_cfg.get("epochs", 50)
-    batch_size = args.batch_size or t_cfg.get("batch_size", 192)
+    batch_size = args.batch_size or t_cfg.get("batch_size", 4)
     lr = args.lr or t_cfg.get("lr", 1e-4)
     save_dir = args.save_dir or t_cfg.get("save_dir", "checkpoints")
     os.makedirs(save_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Train] Using device: {device}")
-    print(f"[Train] Dataset: {dataset_name}, Epochs: {epochs}, Batch size: {batch_size}, LR: {lr}")
+    use_amp = not args.no_amp and device.type == "cuda"
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+    except Exception:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if use_amp else None
+
+    print(f"[Train] Using device: {device} | AMP (FP16): {use_amp}")
+    print(f"[Train] Dataset: {dataset_name}, Epochs: {epochs}, Batch size: {batch_size}, Grad Accum: {args.grad_accum_steps}, LR: {lr}")
 
     # Build model
     model = build_model(cfg, device)
@@ -218,7 +248,8 @@ def main():
     criterion = HORTLoss(
         lambda_pose=l_cfg.get("lambda_pose", 2.0),
         lambda_sparse_cd=l_cfg.get("lambda_sparse_cd", 2.0),
-        lambda_dense_cd=l_cfg.get("lambda_dense_cd", 1.0)
+        lambda_dense_cd=l_cfg.get("lambda_dense_cd", 1.0),
+        chunk_size=l_cfg.get("chamfer_chunk_size", 256)
     )
 
     # Data loaders
@@ -228,7 +259,8 @@ def main():
         batch_size=batch_size,
         shuffle=True,
         num_workers=0 if dataset_name == "dummy" else cfg.get("dataset", {}).get("num_workers", 2),
-        drop_last=False
+        drop_last=False,
+        pin_memory=(device.type == "cuda")
     )
 
     start_epoch = 1
@@ -253,9 +285,13 @@ def main():
             criterion=criterion,
             device=device,
             epoch=epoch,
+            scaler=scaler,
+            grad_accum_steps=args.grad_accum_steps,
             log_interval=t_cfg.get("log_interval", 10)
         )
         scheduler.step()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # Checkpoint saving
         latest_ckpt = {

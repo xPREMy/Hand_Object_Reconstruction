@@ -39,6 +39,12 @@ class ImageEncoder(nn.Module):
                 num_classes=0
             )
 
+        if hasattr(self.backbone, "set_grad_checkpointing"):
+            try:
+                self.backbone.set_grad_checkpointing(True)
+            except Exception:
+                pass
+
         self._freeze_early_layers()
 
     def _freeze_early_layers(self):
