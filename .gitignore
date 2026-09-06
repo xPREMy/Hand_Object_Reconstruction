@@ -1,3 +1,24 @@
 Chen_HORT_Monocular_Hand-held_Objects_Reconstruction_with_Transformers_ICCV_2025_paper.pdf
 venv
 venv/
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Checkpoints and outputs
+checkpoints/
+checkpoints_test/
+output_hort/
+
+# Paper PDF (already listed)
+*.pdf
+
+# Extracted paper text (not needed in repo)
+paper_text.txt
+
+# Test images
+sample_test.png
+
+# Data directories
+data/

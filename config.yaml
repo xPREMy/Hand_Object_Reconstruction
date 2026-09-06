@@ -1,0 +1,59 @@
+# HORT Configuration
+model:
+  image_encoder:
+    backbone: "vit_large_patch14_dinov2"
+    pretrained: true
+    img_size: 224
+    embed_dim: 1024
+    num_frozen_layers: 12
+  hand_encoder:
+    num_verts: 778
+    num_coords: 22  # 16 joints + 5 fingertips + 1 palm
+    in_dim: 67      # 22 * 3 + 1 (vertex index)
+    out_dim: 1024
+  sparse_decoder:
+    hidden_dim: 512
+    num_layers: 10
+    num_heads: 8
+    ffn_dim: 2048
+    num_sparse_points: 2048
+  dense_decoder:
+    feature_map_dim: 128
+    k_knn: 16
+    first_upsample_factor: 2   # 2048 -> 4096
+    second_upsample_factor: 4  # 4096 -> 16384
+    num_dense_points: 16384
+
+loss:
+  lambda_pose: 2.0
+  lambda_sparse_cd: 2.0
+  lambda_dense_cd: 1.0
+
+training:
+  batch_size: 192
+  epochs: 50
+  lr: 0.0001
+  min_lr: 0.000001
+  optimizer: "Adam"
+  scheduler: "cosine"
+  weight_decay: 0.0
+  save_dir: "checkpoints"
+  log_interval: 10
+  val_interval: 1
+
+dataset:
+  name: "obman"
+  data_root: "data/obman"
+  image_size: 224
+  num_workers: 4
+  num_sparse_points: 2048
+  num_dense_points: 16384
+  augmentation:
+    rotation_range: [-90, 90]
+    scale_range: [0.8, 1.2]
+    shift_range: [-0.1, 0.1]
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+
