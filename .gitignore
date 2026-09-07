@@ -25,3 +25,7 @@ data/
 
 # Training checkpoints
 checkpoint/
+checkpoints_mow/
+outputs_mow_infer/
+outputs_mow_test/
+mow/

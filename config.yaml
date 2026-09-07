@@ -43,8 +43,8 @@ training:
   val_interval: 1
 
 dataset:
-  name: "obman"
-  data_root: "data/obman"
+  name: "mow"
+  data_root: "mow/mow"
   image_size: 224
   num_workers: 4
   num_sparse_points: 2048

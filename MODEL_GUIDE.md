@@ -26,6 +26,51 @@ The paper trained on 4× NVIDIA A100 GPUs for ~50 hours.
 On your RTX 4050 with batch_size=8, expect ~10–15× longer (roughly a few weeks for full training).
 For quick experiments, use `--max_samples 5000` to train on a subset.
 
+## Run With the Downloaded MOW Folder
+
+This repository is configured for the downloaded layout:
+
+```text
+mow/mow/images/*.jpg
+mow/mow/models/*.obj
+```
+
+The adapter pairs files by basename, ignores `:Zone.Identifier` sidecars, and
+creates deterministic 80/10/10 train/validation/test splits. This MOW download
+does not include metric hand, camera, or object-pose annotations, so it uses a
+canonical hand proxy, a default camera, and object-centred targets. It is useful
+for checking the complete pipeline, but its reconstruction metrics are not
+comparable to a fully annotated hand-object dataset.
+
+Activate the environment and train:
+
+```bash
+conda activate hand_recon
+python train.py --config config.yaml --dataset mow --epochs 50 --batch_size 1 --grad_accum_steps 4 --save_dir checkpoints_mow
+```
+
+For a quick smoke run before full training:
+
+```bash
+python train.py --config config.yaml --dataset mow --epochs 1 --batch_size 1 --max_samples 8 --save_dir checkpoints_mow_smoke
+```
+
+Evaluate the held-out MOW test split and export predictions:
+
+```bash
+python validate.py --config config.yaml --dataset mow --split test --checkpoint checkpoints_mow/best_model.pt --batch_size 1 --save_dir outputs_mow_test --max_save_models 20
+```
+
+Run inference on one downloaded MOW image, then render the prediction:
+
+```bash
+python infer.py --config config.yaml --checkpoint checkpoints_mow/best_model.pt --image mow/mow/images/board_food_v_LUS1jeTGc68_frame000082.jpg --output outputs_mow_infer
+python visualize.py --output_dir outputs_mow_infer --save_render outputs_mow_infer/reconstruction_render.png --interactive
+```
+
+Use `--interactive` only when a desktop Open3D display is available; the PNG
+render works in headless environments.
+
 ---
 
 ## Phase Overview (What the Model Does)
